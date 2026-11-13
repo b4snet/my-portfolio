@@ -347,6 +347,8 @@ export const KrishnaCharacter: React.FC = () => {
             >
               <input
                 type="text"
+                aria-label="Message Krishna"
+                maxLength={2000}
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
                 placeholder="Ask Krishna or summon Radha Rani..."
