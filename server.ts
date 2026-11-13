@@ -17,11 +17,12 @@ let aiClient: GoogleGenAI | null = null;
 if (apiKey) {
   aiClient = new GoogleGenAI({
     apiKey: apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
+  httpOptions: {
+    timeout: 25000,
+    headers: {
+      'User-Agent': 'aistudio-build',
     },
+  },
   });
 }
 

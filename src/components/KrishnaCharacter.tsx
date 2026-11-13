@@ -182,9 +182,16 @@ export const KrishnaCharacter: React.FC = () => {
         }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => null);
       if (!res.ok) {
-        throw new Error(data?.error || 'Could not reach Krishna right now.');
+        const serverError = typeof data?.error === 'string' ? data.error : null;
+        const message = serverError || (res.status === 404
+          ? 'Krishna’s AI endpoint is not available on this deployment yet.'
+          : 'Could not reach Krishna right now. Please try again.');
+        throw new Error(message);
+      }
+      if (!data || typeof data.reply !== 'string') {
+        throw new Error('Krishna returned an invalid response. Please try again.');
       }
 
       if (data.summon === 'radha' || data.summon === 'calf' || data.summon === 'both') {
