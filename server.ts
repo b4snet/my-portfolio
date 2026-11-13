@@ -4,12 +4,12 @@ import { GoogleGenAI, Type } from '@google/genai';
 import dotenv from 'dotenv';
 import path from 'path';
 
-dotenv.config();
+dotenv.config({ path: ['.env.development.local', '.env'] });
 
 const app = express();
 const PORT = 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '16kb' }));
 
 // Initialize GoogleGenAI client
 const apiKey = process.env.GEMINI_API_KEY;
@@ -17,11 +17,12 @@ let aiClient: GoogleGenAI | null = null;
 if (apiKey) {
   aiClient = new GoogleGenAI({
     apiKey: apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
+  httpOptions: {
+    timeout: 25000,
+    headers: {
+      'User-Agent': 'aistudio-build',
     },
+  },
   });
 }
 
@@ -73,6 +74,89 @@ Personality & Behavior:
 - If they ask for both together, set summon to "both".
 - Otherwise set summon to "auto".`;
 
+type AiResponseSchema = {
+  type: typeof Type.OBJECT;
+  properties: Record<string, unknown>;
+  required?: string[];
+};
+
+async function generateWithFallback({
+  systemInstruction,
+  contents,
+  responseSchema,
+}: {
+  systemInstruction: string;
+  contents: string;
+  responseSchema?: AiResponseSchema;
+}): Promise<{ text: string; provider: 'gemini' | 'groq' }> {
+  const errors: string[] = [];
+
+  if (aiClient) {
+    try {
+      const response = await aiClient.models.generateContent({
+        model: 'gemini-3.5-flash',
+        contents,
+        config: {
+          systemInstruction,
+          responseMimeType: 'application/json',
+          ...(responseSchema ? { responseSchema } : {}),
+        },
+      });
+      if (!response.text) throw new Error('Gemini returned an empty response.');
+      return { text: response.text, provider: 'gemini' };
+    } catch (error) {
+      console.error('Gemini request failed; trying Groq fallback.');
+      errors.push('Gemini request failed.');
+    }
+  }
+
+  const groqApiKey = process.env.GROQ_API_KEY;
+  if (groqApiKey) {
+    const requestedFields = responseSchema ? Object.keys(responseSchema.properties) : [];
+    const jsonContract = requestedFields.length
+      ? ` Use exactly these JSON keys: ${requestedFields.join(', ')}.`
+      : '';
+    try {
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${groqApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: 'openai/gpt-oss-120b',
+          messages: [
+            { role: 'system', content: `${systemInstruction}\nReturn only valid JSON.${jsonContract}` },
+            { role: 'user', content: contents },
+          ],
+          response_format: { type: 'json_object' },
+          temperature: 0.7,
+          max_tokens: 500,
+        }),
+        signal: AbortSignal.timeout(25000),
+      });
+
+      if (!response.ok) {
+        console.error(`Groq request failed with status ${response.status}.`);
+        throw new Error('Groq request failed.');
+      }
+
+      const payload = await response.json();
+      const text = payload?.choices?.[0]?.message?.content;
+      if (typeof text !== 'string' || !text.trim()) throw new Error('Groq returned an empty response.');
+      return { text, provider: 'groq' };
+    } catch (error) {
+      console.error('Groq fallback request failed.');
+      errors.push('Groq request failed.');
+    }
+  }
+
+  if (!aiClient && !groqApiKey) {
+    throw new Error('AI is not configured. Add GEMINI_API_KEY and/or GROQ_API_KEY to the project environment.');
+  }
+  throw new Error(errors.join(' '));
+}
+
 // Server-side AI chat endpoint for the Krishna + Calf + Radha Rani bot
 app.post('/api/krishna-chat', async (req, res) => {
   try {
@@ -82,64 +166,63 @@ app.post('/api/krishna-chat', async (req, res) => {
       activeCompanion?: 'calf' | 'radha' | 'both';
     };
 
-    const userText = (message || '').trim();
+    const userText = typeof message === 'string' ? message.trim() : '';
     if (!userText) {
       return res.status(400).json({ error: 'Please enter a message for Krishna.' });
     }
-
-    if (!aiClient) {
-      const lower = userText.toLowerCase();
-      let summon: 'calf' | 'radha' | 'both' | 'auto' = 'auto';
-      let reply = "Just as focused attention steadies the mind, neural plasticity reshapes every circuit we nurture. Ask me about Dipson's research on Parkinson's disease, deep brain stimulation, or call upon Radha Rani and the little calf anytime.";
-      if (lower.includes('radha')) {
-        summon = 'radha';
-        reply = 'Shri Radha Rani graces this quiet moment beside the flute. May clarity, devotion, and calm curiosity guide your thoughts as you explore Dipson’s work.';
-      } else if (lower.includes('calf') || lower.includes('cow')) {
-        summon = 'calf';
-        reply = 'Here hops the gentle white calf back to my side, bells ringing softly. Like a calm breath, simple stillness prepares the brain for deep discovery.';
-      }
-      return res.json({ reply, summon, isFallback: true });
+    if (userText.length > 2000) {
+      return res.status(413).json({ error: 'Please keep messages under 2,000 characters.' });
     }
 
-    const recentHistory = history
-      .slice(-6)
-      .map((m) => `${m.role === 'user' ? 'Visitor' : 'Krishna'}: ${m.content}`)
-      .join('\n');
+    const companionModes = ['calf', 'radha', 'both'];
+    const safeCompanion = companionModes.includes(activeCompanion) ? activeCompanion : 'calf';
+    const recentHistory = Array.isArray(history)
+      ? history
+          .filter((item) => item && (item.role === 'user' || item.role === 'assistant') && typeof item.content === 'string')
+          .slice(-6)
+          .map((item) => `${item.role === 'user' ? 'Visitor' : 'Krishna'}: ${item.content.slice(0, 1000)}`)
+          .join('\n')
+      : '';
 
-    const prompt = `Current visible companion beside Krishna: ${activeCompanion}.
-${recentHistory ? `Recent conversation:\n${recentHistory}\n` : ''}Visitor says: "${userText}"`;
+    const prompt = `Current visible companion beside Krishna: ${safeCompanion}.\n${recentHistory ? `Recent conversation:\n${recentHistory}\n` : ''}Visitor says: "${userText}"`;
 
-    const response = await aiClient.models.generateContent({
-      model: 'gemini-4-hydrogen',
+    const { text, provider } = await generateWithFallback({
+      systemInstruction: PORTFOLIO_SYSTEM_INSTRUCTION,
       contents: prompt,
-      config: {
-        systemInstruction: PORTFOLIO_SYSTEM_INSTRUCTION,
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            reply: {
-              type: Type.STRING,
-              description: 'Krishna response in 2-4 concise, warm sentences.',
-            },
-            summon: {
-              type: Type.STRING,
-              description: 'Must be one of: "radha", "calf", "both", or "auto".',
-            },
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          reply: {
+            type: Type.STRING,
+            description: 'Krishna response in 2-4 concise, warm sentences.',
           },
-          required: ['reply', 'summon'],
+          summon: {
+            type: Type.STRING,
+            description: 'Must be one of: "radha", "calf", "both", or "auto".',
+          },
         },
+        required: ['reply', 'summon'],
       },
     });
 
-    const parsed = JSON.parse(response.text || '{}');
+    const parsed = JSON.parse(text) as Record<string, unknown> | null;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('The AI returned an invalid chat response.');
+    }
+
     const validSummons = ['radha', 'calf', 'both', 'auto'];
-    const summon = validSummons.includes(parsed.summon) ? parsed.summon : 'auto';
+    const summon = typeof parsed.summon === 'string' && validSummons.includes(parsed.summon)
+      ? parsed.summon
+      : 'auto';
+    const reply = typeof parsed.reply === 'string' && parsed.reply.trim()
+      ? parsed.reply.trim()
+      : 'Peaceful mind, luminous circuits. What would you like to explore on Dipson’s portfolio?';
 
     return res.json({
-      reply: parsed.reply || 'Peaceful mind, luminous circuits. What would you like to explore on Dipson’s portfolio?',
+      reply,
       summon,
-      isFallback: false,
+      provider,
+      isFallback: provider !== 'gemini',
     });
   } catch (error: any) {
     console.error('Gemini API chat error:', error?.message);
@@ -152,37 +235,34 @@ ${recentHistory ? `Recent conversation:\n${recentHistory}\n` : ''}Visitor says: 
 // Server-side AI reflection endpoint combining Vedic philosophy and Neuroscience
 app.post('/api/reflect', async (req, res) => {
   try {
-    const { topic } = req.body;
-    const queryTopic = topic || 'consciousness and peace of mind';
+    const topic = typeof req.body?.topic === 'string' ? req.body.topic.trim() : '';
+    const queryTopic = (topic || 'consciousness and peace of mind').slice(0, 300);
 
-    if (!aiClient) {
-      const selected = FALLBACK_REFLECTIONS[Math.floor(Math.random() * FALLBACK_REFLECTIONS.length)];
-      return res.json({
-        quote: selected.quote,
-        source: selected.source,
-        reflection: selected.connection,
-        isFallback: true,
-      });
-    }
-
-    const response = await aiClient.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: `Provide a short, serene, authentic philosophical reflection connecting Vedic wisdom (e.g. Bhagavad Gita, Upanishads, or Sushruta Samhita) with modern neuroscience, human biology, or cognitive architecture for a student studying consciousness. The topic is: "${queryTopic}".
-Respond in JSON format with these exact keys:
-- "quote": A short, authentic Sanskrit/Vedic quote translated into English (1-2 sentences).
-- "source": The exact scripture reference (e.g., "Bhagavad Gita 2.47").
-- "reflection": A concise 2-3 sentence reflection bridging this insight to neuroscience, neural plasticity, or the mind.`,
-      config: {
-        responseMimeType: 'application/json',
+    const { text, provider } = await generateWithFallback({
+      systemInstruction: 'You are a careful, thoughtful guide connecting Vedic philosophy with modern neuroscience. Return only valid JSON.',
+      contents: `Provide a short, serene, authentic philosophical reflection connecting Vedic wisdom (e.g. Bhagavad Gita, Upanishads, or Sushruta Samhita) with modern neuroscience, human biology, or cognitive architecture for a student studying consciousness. The topic is: "${queryTopic}". Keep the quote authentic and do not invent a scripture citation.`,
+      responseSchema: {
+        type: Type.OBJECT,
+        properties: {
+          quote: { type: Type.STRING, description: 'A short authentic Vedic quote translated into English.' },
+          source: { type: Type.STRING, description: 'The exact scripture reference.' },
+          reflection: { type: Type.STRING, description: 'A concise 2-3 sentence connection to neuroscience.' },
+        },
+        required: ['quote', 'source', 'reflection'],
       },
     });
 
-    const parsed = JSON.parse(response.text || '{}');
+    const parsed = JSON.parse(text) as Record<string, unknown> | null;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('The AI returned an invalid reflection.');
+    }
+
     return res.json({
-      quote: parsed.quote || FALLBACK_REFLECTIONS[0].quote,
-      source: parsed.source || FALLBACK_REFLECTIONS[0].source,
-      reflection: parsed.reflection || FALLBACK_REFLECTIONS[0].connection,
-      isFallback: false,
+      quote: typeof parsed.quote === 'string' && parsed.quote.trim() ? parsed.quote.trim() : FALLBACK_REFLECTIONS[0].quote,
+      source: typeof parsed.source === 'string' && parsed.source.trim() ? parsed.source.trim() : FALLBACK_REFLECTIONS[0].source,
+      reflection: typeof parsed.reflection === 'string' && parsed.reflection.trim() ? parsed.reflection.trim() : FALLBACK_REFLECTIONS[0].connection,
+      provider,
+      isFallback: provider !== 'gemini',
     });
   } catch (error: any) {
     console.error('Gemini API reflection error:', error?.message);
